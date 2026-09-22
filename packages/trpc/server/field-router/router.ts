@@ -4,6 +4,7 @@ import { deleteDocumentField } from '@documenso/lib/server-only/field/delete-doc
 import { deleteTemplateField } from '@documenso/lib/server-only/field/delete-template-field';
 import { getFieldById } from '@documenso/lib/server-only/field/get-field-by-id';
 import { removeSignedFieldWithToken } from '@documenso/lib/server-only/field/remove-signed-field-with-token';
+import { repositionFieldWithToken } from '@documenso/lib/server-only/field/reposition-field-with-token';
 import { setFieldsForDocument } from '@documenso/lib/server-only/field/set-fields-for-document';
 import { setFieldsForTemplate } from '@documenso/lib/server-only/field/set-fields-for-template';
 import { signFieldWithToken } from '@documenso/lib/server-only/field/sign-field-with-token';
@@ -26,6 +27,7 @@ import {
   ZGetFieldRequestSchema,
   ZGetFieldResponseSchema,
   ZRemovedSignedFieldWithTokenMutationSchema,
+  ZRepositionFieldWithTokenMutationSchema,
   ZSetDocumentFieldsRequestSchema,
   ZSetDocumentFieldsResponseSchema,
   ZSetFieldsForTemplateRequestSchema,
@@ -675,6 +677,44 @@ export const fieldRouter = router({
         });
 
         console.log('Error removing signed field with token', err);
+
+        // Rethrow the error so that the client receives the appropriate error response.
+        throw err;
+      }
+    }),
+
+  /**
+   * @private
+   */
+  repositionFieldWithToken: procedure
+    .input(ZRepositionFieldWithTokenMutationSchema)
+    .mutation(async ({ input, ctx }) => {
+      try {
+        const { token, fieldId, positionX, positionY, width, height } = input;
+
+        ctx.logger.info({
+          input: {
+            fieldId,
+          },
+        });
+
+        return await repositionFieldWithToken({
+          token,
+          fieldId,
+          positionX,
+          positionY,
+          width,
+          height,
+          requestMetadata: ctx.metadata.requestMetadata,
+        });
+      } catch (err) {
+        // Log the error for debugging purposes.
+        ctx.logger.error({
+          message: 'Error repositioning field with token',
+          error: err instanceof AppError ? `[${err.code}]: ${err.message}` : String(err),
+        });
+
+        console.log('Error repositioning field with token', err);
 
         // Rethrow the error so that the client receives the appropriate error response.
         throw err;

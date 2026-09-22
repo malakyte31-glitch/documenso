@@ -159,6 +159,33 @@ export const ZSignFieldWithTokenMutationSchema = z.object({
 
 export type TSignFieldWithTokenMutationSchema = z.infer<typeof ZSignFieldWithTokenMutationSchema>;
 
+/**
+ * Lets a recipient reposition/resize a field assigned to them before it has
+ * been inserted. Percentages are bounded to [0, 100] and each field must
+ * stay fully within the page (position + size <= 100) -- the coordinates
+ * came from an untrusted browser, so this is validated here rather than
+ * trusted merely because the client already clamps it.
+ */
+export const ZRepositionFieldWithTokenMutationSchema = z
+  .object({
+    token: z.string(),
+    fieldId: z.number(),
+    positionX: z.number().min(0).max(100),
+    positionY: z.number().min(0).max(100),
+    width: z.number().min(1).max(100),
+    height: z.number().min(1).max(100),
+  })
+  .refine((data) => data.positionX + data.width <= 100, {
+    message: 'Field would extend past the right edge of the page.',
+    path: ['width'],
+  })
+  .refine((data) => data.positionY + data.height <= 100, {
+    message: 'Field would extend past the bottom edge of the page.',
+    path: ['height'],
+  });
+
+export type TRepositionFieldWithTokenMutationSchema = z.infer<typeof ZRepositionFieldWithTokenMutationSchema>;
+
 export const ZRemovedSignedFieldWithTokenMutationSchema = z.object({
   token: z.string(),
   fieldId: z.number(),

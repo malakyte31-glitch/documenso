@@ -1,17 +1,22 @@
+import { DO_NOT_INVALIDATE_QUERY_ON_MUTATION } from '@documenso/lib/constants/trpc';
 import type { TRecipientActionAuth } from '@documenso/lib/types/document-auth';
 import { ZFieldMetaSchema } from '@documenso/lib/types/field-meta';
 import type { FieldWithSignature } from '@documenso/prisma/types/field-with-signature';
+import { trpc } from '@documenso/trpc/react';
+import type { FieldGeometry } from '@documenso/ui/components/field/field';
 import { FieldRootContainer } from '@documenso/ui/components/field/field';
 import { getRecipientColorStyles } from '@documenso/ui/lib/recipient-colors';
 import { cn } from '@documenso/ui/lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@documenso/ui/primitives/tooltip';
+import { useToast } from '@documenso/ui/primitives/use-toast';
 import { Trans } from '@lingui/react/macro';
 import { FieldType } from '@prisma/client';
 import { TooltipArrow } from '@radix-ui/react-tooltip';
-import { X } from 'lucide-react';
+import { GripVertical, X } from 'lucide-react';
 import type React from 'react';
 
 import { useRequiredDocumentSigningAuthContext } from './document-signing-auth-provider';
+import { useDocumentSigningRecipientContext } from './document-signing-recipient-provider';
 
 export type DocumentSigningFieldContainerProps = {
   field: FieldWithSignature;
@@ -53,9 +58,37 @@ export const DocumentSigningFieldContainer = ({
   tooltipText,
 }: DocumentSigningFieldContainerProps) => {
   const { executeActionAuthProcedure, isAuthRedirectRequired } = useRequiredDocumentSigningAuthContext();
+  const { recipient } = useDocumentSigningRecipientContext();
+  const { toast } = useToast();
+
+  const { mutateAsync: repositionFieldWithToken } = trpc.field.repositionFieldWithToken.useMutation(
+    DO_NOT_INVALIDATE_QUERY_ON_MUTATION,
+  );
 
   const parsedFieldMeta = field.fieldMeta ? ZFieldMetaSchema.parse(field.fieldMeta) : undefined;
   const readOnlyField = parsedFieldMeta?.readOnly || false;
+
+  // A recipient may reposition/resize their own field only up until it's
+  // finalized -- once `inserted`, geometry is locked (server-enforced
+  // independently; this only avoids rendering controls for an action that
+  // would be rejected anyway).
+  const isFieldEditable = !field.inserted && !loading && !readOnlyField;
+
+  const handleReposition = async (geometry: FieldGeometry) => {
+    try {
+      await repositionFieldWithToken({
+        token: recipient.token,
+        fieldId: field.id,
+        ...geometry,
+      });
+    } catch {
+      toast({
+        title: 'Could not save field position',
+        description: "Your change to this field's position or size could not be saved. Please try again.",
+        variant: 'destructive',
+      });
+    }
+  };
 
   const handleInsertField = async () => {
     if (field.inserted || !onSign) {
@@ -116,8 +149,37 @@ export const DocumentSigningFieldContainer = ({
     await onRemove?.(fieldType);
   };
 
+  // Purely a mouse/touch drag affordance for react-rnd -- there is no
+  // keyboard equivalent for dragging in this implementation, so this is
+  // intentionally excluded from the accessibility tree (aria-hidden)
+  // rather than given a misleading interactive role. It also sits
+  // entirely outside the insert button's own bounds (negative offset vs.
+  // that button's `inset-0`), so the two never share a hit area at all.
+  // Passed via FieldRootContainer's `dragHandle` prop rather than as a
+  // plain child: a plain child would render *inside* #field-{id}, which
+  // sets its own position+z-index and so traps any descendant's z-index
+  // inside its own stacking context -- no z-index on a nested drag
+  // handle could ever out-rank a SIBLING of #field-{id} (like the
+  // field's own resize handles, z-30). Rendering it as a true sibling
+  // instead lets its z-40 actually mean something against those.
+  const dragHandle = isFieldEditable && (
+    <div
+      aria-hidden="true"
+      className="field-drag-handle absolute -top-3 -left-3 z-40 flex h-6 w-6 cursor-move items-center justify-center rounded-full border bg-background shadow-sm"
+      title="Drag to reposition"
+    >
+      <GripVertical className="h-3.5 w-3.5 text-muted-foreground" />
+    </div>
+  );
+
   return (
-    <FieldRootContainer color={getRecipientColorStyles(field.fieldMeta?.readOnly ? 'readOnly' : 0)} field={field}>
+    <FieldRootContainer
+      color={getRecipientColorStyles(field.fieldMeta?.readOnly ? 'readOnly' : 0)}
+      field={field}
+      editable={isFieldEditable}
+      onReposition={isFieldEditable ? handleReposition : undefined}
+      dragHandle={dragHandle}
+    >
       {!field.inserted && !loading && !readOnlyField && (
         <button
           type="submit"
