@@ -61,9 +61,6 @@ import { useRequiredEnvelopeSigningContext } from '../document-signing/envelope-
 /** How far past a resize handle you can still grab it, in screen pixels -- matches EnvelopeEditorFieldsPageRenderer's own transformer. */
 const TRANSFORMER_ANCHOR_HIT_STROKE_PX = 24;
 
-/** Diameter, in unscaled page pixels, of the recipient's own drag-handle affordance. */
-const DRAG_HANDLE_SIZE_PX = 20;
-
 type GenericLocalField = TEnvelope['fields'][number] & {
   recipient: Pick<Recipient, 'id' | 'name' | 'email' | 'signingStatus'>;
 };
@@ -190,6 +187,20 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
 
     const color = fieldToRender.fieldMeta?.readOnly ? 'readOnly' : isValidating ? 'orange' : 'green';
 
+    // A recipient may reposition/resize their own field up until it's
+    // inserted -- the exact same UX gate document-signing-field-container.tsx
+    // (the V1/DOM path) uses. This is UX only: repositionFieldWithToken
+    // re-derives and enforces the real eligibility server-side regardless
+    // of what the client believes here. Computed before renderField() so
+    // it can be passed straight through as `editable`: upsertFieldGroup
+    // (shared with EnvelopeEditorFieldsPageRenderer, the sender editor)
+    // sets fieldGroup's own `draggable` attr from this flag, making
+    // fieldGroup itself the field's drag surface -- there is no separate
+    // drag-handle node. Konva's own drag engine plus the dragBoundFunc
+    // upsertFieldGroup already sets handle page-edge clamping, so moving a
+    // field never needs any manual coordinate math here.
+    const isFieldEditable = !fieldToRender.inserted && !fieldToRender.fieldMeta?.readOnly;
+
     const { fieldGroup } = renderField({
       scale,
       pageLayer: pageLayer.current,
@@ -208,15 +219,9 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
       pageHeight: unscaledViewport.height,
       color,
       mode: 'sign',
+      editable: isFieldEditable,
       fieldCanvasStyleCache,
     });
-
-    // A recipient may reposition/resize their own field up until it's
-    // inserted -- the exact same UX gate document-signing-field-container.tsx
-    // (the V1/DOM path) uses. This is UX only: repositionFieldWithToken
-    // re-derives and enforces the real eligibility server-side regardless
-    // of what the client believes here.
-    const isFieldEditable = !fieldToRender.inserted && !fieldToRender.fieldMeta?.readOnly;
 
     /**
      * Reads the field's current on-screen bounding box and converts it to
@@ -227,12 +232,12 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
      * result is correct at any zoom level.
      *
      * Deliberately measures the '.field-rect' CHILD, not fieldGroup itself:
-     * fieldGroup.getClientRect() includes every descendant, and the drag
-     * handle is one -- while it's being actively dragged (potentially far
-     * from the field's own corner), including it would inflate the
-     * measured bounding box into something bigger than the field's actual
-     * visual size. EnvelopeEditorFieldsPageRenderer's own fieldGroup has no
-     * such extra child, so it doesn't need this distinction.
+     * every field type's own render-*-field.ts may add other descendants
+     * (e.g. a loading spinner), and measuring '.field-rect' directly keeps
+     * this immune to any of them rather than needing to know about each
+     * one. EnvelopeEditorFieldsPageRenderer's own fieldGroup has no such
+     * extra children at persistence time, so it doesn't need this
+     * distinction.
      */
     const getFieldPercentageGeometry = () => {
       const fieldRect = fieldGroup.findOne('.field-rect');
@@ -262,6 +267,18 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
      * reset here. On rejection, repaints from the field's last known-good
      * geometry so a rejected change never leaves a mismatched shape on
      * screen -- the server, not this code, is what decided the rejection.
+     *
+     * Synchronously locks geometry editing (destroys the Transformer,
+     * disables fieldGroup's own dragging) BEFORE awaiting the mutation --
+     * mirroring signField's own lockFieldGeometryEditing call for
+     * insertion -- so a second drag or resize on this field can never
+     * begin while this request is still in flight. That in-flight gap
+     * (previously unguarded) is what let one gesture's stale, still-
+     * transforming state get read by a second, overlapping gesture.
+     * Restoring interactivity, if the field is still eligible, happens
+     * naturally: both branches below re-render via renderFieldOnLayer,
+     * which recomputes isFieldEditable fresh and reapplies the
+     * Transformer/draggable state accordingly.
      */
     const persistFieldGeometry = async (geometry: {
       positionX: number;
@@ -269,6 +286,8 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
       width: number;
       height: number;
     }) => {
+      lockFieldGeometryEditing(fieldToRender.id);
+
       try {
         await repositionFieldWithToken({
           token: recipient.token,
@@ -301,12 +320,11 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
       }
     };
 
-    // Tear down any transformer/handle left over from a previous render of
-    // this same field before deciding whether to reattach -- see the
+    // Tear down any transformer left over from a previous render of this
+    // same field before deciding whether to reattach -- see the
     // fieldTransformers doc comment above for why this can't be skipped.
     fieldTransformers.current.get(fieldToRender.id)?.destroy();
     fieldTransformers.current.delete(fieldToRender.id);
-    fieldGroup.findOne('.field-drag-handle')?.destroy();
 
     if (isFieldEditable) {
       // Resize handles, reusing EnvelopeEditorFieldsPageRenderer's own
@@ -319,15 +337,6 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
         nodes: [fieldGroup],
         rotateEnabled: false,
         keepRatio: false,
-        // Deliberately NOT shouldOverdrawWholeArea (EnvelopeEditorFieldsPageRenderer's
-        // sender-side transformer sets this true, but that's because its
-        // fieldGroup itself is fully draggable and relies on this to catch
-        // click/drag anywhere on the field's body). Here fieldGroup stays
-        // non-draggable and the field's own pointerdown-bound click-to-
-        // insert handler must keep working normally -- shouldOverdrawWholeArea
-        // creates an interactive 'back' rect spanning the whole node that
-        // would otherwise sit on top of the field and swallow that click
-        // before it ever reaches the field-rect underneath.
         ignoreStroke: true,
         flipEnabled: false,
         anchorStyleFunc: (anchor) => {
@@ -350,92 +359,23 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
         void persistFieldGeometry(getFieldPercentageGeometry());
       });
 
-      // A small, dedicated drag affordance -- a CHILD of fieldGroup, not
-      // fieldGroup itself made draggable. fieldGroup's own pointerdown
-      // handler (handleFieldGroupClick, bound below, unchanged) is what
-      // triggers click-to-insert/sign; keeping fieldGroup itself
-      // non-draggable means that binding never has to distinguish a drag
-      // from a click at all. Konva bubbles events up to ancestors, so the
-      // handle stops its own pointerdown from reaching that listener.
-      const dragHandle = new Konva.Group({
-        name: 'field-drag-handle',
-        x: -DRAG_HANDLE_SIZE_PX / 2,
-        y: -DRAG_HANDLE_SIZE_PX / 2,
-        draggable: true,
-      });
-
-      dragHandle.add(
-        new Konva.Circle({
-          radius: DRAG_HANDLE_SIZE_PX / 2,
-          fill: 'white',
-          stroke: '#9ca3af',
-          strokeWidth: 1,
-        }),
-      );
-
-      for (const dy of [-4, 0, 4]) {
-        dragHandle.add(
-          new Konva.Line({
-            points: [-4, dy, 4, dy],
-            stroke: '#6b7280',
-            strokeWidth: 1.5,
-            lineCap: 'round',
-            listening: false,
-          }),
-        );
-      }
-
-      dragHandle.on('pointerdown', (e) => {
-        e.cancelBubble = true;
-      });
-
-      let dragOrigin = { groupX: 0, groupY: 0, handleX: 0, handleY: 0 };
-
-      dragHandle.on('dragstart', () => {
-        dragOrigin = {
-          groupX: fieldGroup.x(),
-          groupY: fieldGroup.y(),
-          handleX: dragHandle.x(),
-          handleY: dragHandle.y(),
-        };
-      });
-
-      dragHandle.on('dragmove', () => {
-        const deltaX = dragHandle.x() - dragOrigin.handleX;
-        const deltaY = dragHandle.y() - dragOrigin.handleY;
-
-        // Measure '.field-rect', not fieldGroup -- see getFieldPercentageGeometry's
-        // doc comment above for why (the drag handle, a fieldGroup child,
-        // is being actively repositioned right now and would otherwise
-        // inflate fieldGroup's own bounding box).
-        const fieldRectForClamp = fieldGroup.findOne('.field-rect');
-        const { width: fieldWidthPx, height: fieldHeightPx } = (fieldRectForClamp ?? fieldGroup).getClientRect({
-          skipStroke: true,
-          skipShadow: true,
-        });
-
-        // Bound the FIELD to the page (matching upsertFieldGroup's own
-        // dragBoundFunc) -- the handle itself is intentionally left to
-        // follow the raw pointer, so it can briefly separate from the
-        // field near a page edge rather than fighting Konva's own drag
-        // tracking by also rewriting the dragged node's position here.
-        const maxX = scaledViewport.width - fieldWidthPx;
-        const maxY = scaledViewport.height - fieldHeightPx;
-
-        fieldGroup.position({
-          x: Math.max(0, Math.min(maxX, dragOrigin.groupX + deltaX)),
-          y: Math.max(0, Math.min(maxY, dragOrigin.groupY + deltaY)),
-        });
-
-        pageLayer.current?.batchDraw();
-      });
-
-      dragHandle.on('dragend', () => {
+      // fieldGroup itself is the field's drag surface -- upsertFieldGroup
+      // (called from renderField() above, via the `editable` flag passed
+      // through) already set `draggable: true` and a dragBoundFunc
+      // clamping it to the page, using Konva's own native drag engine.
+      // There is no separate drag-handle node: the diagnosed grip/body
+      // coordinate-space mismatch, grip/Transformer hit-region collision,
+      // and grip deformation under non-uniform Transformer scaling were
+      // all consequences of that now-removed node, not of fieldGroup's own
+      // dragging. Click-to-insert (handleFieldGroupClick, bound below) is
+      // wired to Konva's 'click'/'tap' events rather than 'pointerdown', so
+      // Konva's own drag-distance threshold naturally suppresses it once a
+      // real drag has started, instead of needing a second interactive
+      // node to keep the two gestures apart.
+      fieldGroup.off('dragend');
+      fieldGroup.on('dragend', () => {
         void persistFieldGeometry(getFieldPercentageGeometry());
       });
-
-      fieldGroup.add(dragHandle);
-      dragHandle.moveToTop();
     }
 
     const handleFieldGroupClick = (e: KonvaEventObject<Event>) => {
@@ -677,8 +617,14 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
         .exhaustive();
     };
 
-    fieldGroup.off('pointerdown');
-    fieldGroup.on('pointerdown', handleFieldGroupClick);
+    // 'click'/'tap' rather than 'pointerdown': Konva fires these only on a
+    // genuine tap/click (pointerup without an intervening real drag past
+    // its own drag-distance threshold), and suppresses them automatically
+    // once a drag has started -- letting fieldGroup be draggable (for
+    // moving the field) and still insert/sign on an ordinary click without
+    // this handler needing to distinguish the two gestures itself.
+    fieldGroup.off('click tap');
+    fieldGroup.on('click tap', handleFieldGroupClick);
   };
 
   const renderFieldOnLayer = (
@@ -762,23 +708,33 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
 
   /**
    * Immediately (synchronously, before any network round-trip) tears down
-   * a field's Transformer/drag handle so a drag or resize can never be
-   * initiated -- or land -- while an insertion request for that same
-   * field is in flight. This is the actual defect from the live P3-C
-   * incident: geometry controls stayed interactive for the round-trip
-   * duration of an insert, long enough for a real drag/resize gesture to
-   * race it. Waiting for the broader recipientFields refresh (which is
-   * how re-renders normally happen) was too slow -- this acts on the
-   * exact Konva nodes directly, at the one place (signField) every
-   * insertion attempt already funnels through, rather than duplicating
-   * this in each of handleFieldGroupClick's per-type branches.
+   * a field's Transformer and disables fieldGroup's own native dragging,
+   * so a drag or resize can never be initiated -- or land -- while an
+   * insertion OR reposition request for that same field is in flight.
+   * This is the actual defect from the live P3-C incident: geometry
+   * controls stayed interactive for the round-trip duration of a mutation,
+   * long enough for a real drag/resize gesture to race it. Waiting for
+   * the broader recipientFields refresh (which is how re-renders normally
+   * happen) was too slow -- this acts on the exact Konva nodes directly,
+   * at the two places (signField, persistFieldGeometry) every insertion
+   * or reposition attempt already funnels through, rather than
+   * duplicating this in each of handleFieldGroupClick's per-type
+   * branches. fieldGroup is now the field's own drag surface (there is no
+   * separate drag-handle node), so destroying the Transformer alone is
+   * not enough -- fieldGroup's `draggable` flag has to be turned off
+   * explicitly too, and any drag already in progress stopped outright.
    */
   const lockFieldGeometryEditing = (fieldId: number) => {
     fieldTransformers.current.get(fieldId)?.destroy();
     fieldTransformers.current.delete(fieldId);
 
     const targetGroup = pageLayer.current?.findOne<Konva.Group>(`#${fieldId}`);
-    targetGroup?.findOne('.field-drag-handle')?.destroy();
+
+    if (targetGroup?.isDragging()) {
+      targetGroup.stopDrag();
+    }
+
+    targetGroup?.draggable(false);
 
     pageLayer.current?.batchDraw();
   };
@@ -789,9 +745,9 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
    * field.inserted becoming true (a failure, or a legitimate non-
    * inserting outcome like a checkbox being unchecked) -- eligibility
    * (!inserted && !readOnly) is recomputed fresh, so this naturally
-   * restores the Transformer/drag handle when (and only when) the field
-   * is actually still eligible, without needing a parallel "was this
-   * locked by me" flag.
+   * restores the Transformer and fieldGroup's own draggable state when
+   * (and only when) the field is actually still eligible, without
+   * needing a parallel "was this locked by me" flag.
    */
   const restoreFieldGeometryEditingIfEligible = (fieldId: number) => {
     const currentField = localPageFields.find((f) => f.id === fieldId);
