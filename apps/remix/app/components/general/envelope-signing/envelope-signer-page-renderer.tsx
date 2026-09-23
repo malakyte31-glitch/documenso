@@ -7,6 +7,7 @@ import {
 import { useOptionalSession } from '@documenso/lib/client-only/providers/session';
 import { DIRECT_TEMPLATE_RECIPIENT_EMAIL } from '@documenso/lib/constants/direct-templates';
 import { isBase64Image } from '@documenso/lib/constants/signatures';
+import { DO_NOT_INVALIDATE_QUERY_ON_MUTATION } from '@documenso/lib/constants/trpc';
 import type { TRecipientActionAuth } from '@documenso/lib/types/document-auth';
 import type { TEnvelope } from '@documenso/lib/types/envelope';
 import { ZFullFieldSchema } from '@documenso/lib/types/field';
@@ -15,17 +16,31 @@ import {
   type FieldCanvasStyleCache,
 } from '@documenso/lib/universal/field-renderer/field-canvas-style';
 import { createSpinner } from '@documenso/lib/universal/field-renderer/field-generic-items';
+import {
+  convertPixelToPercentage,
+  MIN_FIELD_HEIGHT_PX,
+  MIN_FIELD_WIDTH_PX,
+} from '@documenso/lib/universal/field-renderer/field-renderer';
 import { renderField } from '@documenso/lib/universal/field-renderer/render-field';
 import { isFieldUnsignedAndRequired } from '@documenso/lib/utils/advanced-fields-helpers';
 import { getClientSideFieldTranslations } from '@documenso/lib/utils/fields';
 import { extractInitials } from '@documenso/lib/utils/recipient-formatter';
+import { trpc } from '@documenso/trpc/react';
 import type { TSignEnvelopeFieldValue } from '@documenso/trpc/server/envelope-router/sign-envelope-field.types';
 import { EnvelopeRecipientFieldTooltip } from '@documenso/ui/components/document/envelope-recipient-field-tooltip';
 import { EnvelopeFieldToolTip } from '@documenso/ui/components/field/envelope-field-tooltip';
 import { useToast } from '@documenso/ui/primitives/use-toast';
 import { Trans, useLingui } from '@lingui/react/macro';
-import { type Field, FieldType, type Recipient, RecipientRole, type Signature, SigningStatus } from '@prisma/client';
-import type Konva from 'konva';
+import {
+  type Field,
+  FieldType,
+  Prisma,
+  type Recipient,
+  RecipientRole,
+  type Signature,
+  SigningStatus,
+} from '@prisma/client';
+import Konva from 'konva';
 import type { KonvaEventObject } from 'konva/lib/Node';
 import { useEffect, useMemo, useRef } from 'react';
 import { match } from 'ts-pattern';
@@ -42,6 +57,12 @@ import { handleTextFieldClick } from '~/utils/field-signing/text-field';
 
 import { useRequiredDocumentSigningAuthContext } from '../document-signing/document-signing-auth-provider';
 import { useRequiredEnvelopeSigningContext } from '../document-signing/envelope-signing-provider';
+
+/** How far past a resize handle you can still grab it, in screen pixels -- matches EnvelopeEditorFieldsPageRenderer's own transformer. */
+const TRANSFORMER_ANCHOR_HIT_STROKE_PX = 24;
+
+/** Diameter, in unscaled page pixels, of the recipient's own drag-handle affordance. */
+const DRAG_HANDLE_SIZE_PX = 20;
 
 type GenericLocalField = TEnvelope['fields'][number] & {
   recipient: Pick<Recipient, 'id' | 'name' | 'email' | 'signingStatus'>;
@@ -90,12 +111,25 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
 
   const { onFieldSigned, onFieldUnsigned } = useEmbedSigningContext() || {};
 
-  const { stage, pageLayer, konvaContainer, unscaledViewport } = usePageRenderer(
+  const { stage, pageLayer, konvaContainer, unscaledViewport, scaledViewport } = usePageRenderer(
     ({ stage, pageLayer }) => createPageCanvas(stage, pageLayer),
     pageData,
   );
 
   const { scale, pageNumber } = pageData;
+
+  const { mutateAsync: repositionFieldWithToken } = trpc.field.repositionFieldWithToken.useMutation(
+    DO_NOT_INVALIDATE_QUERY_ON_MUTATION,
+  );
+
+  // Konva.Transformer instances currently attached for the recipient's own
+  // editable (not-yet-inserted, not read-only) fields, keyed by field id.
+  // upsertFieldGroup/upsertFieldRect reuse (never recreate) the field's own
+  // Konva.Group across re-renders, so a field that becomes ineligible (e.g.
+  // just got inserted) needs its transformer torn down explicitly rather
+  // than leaking a still-interactive one attached to a field that no
+  // longer permits editing.
+  const fieldTransformers = useRef<Map<number, Konva.Transformer>>(new Map());
 
   const { envelope } = envelopeData;
 
@@ -176,6 +210,233 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
       mode: 'sign',
       fieldCanvasStyleCache,
     });
+
+    // A recipient may reposition/resize their own field up until it's
+    // inserted -- the exact same UX gate document-signing-field-container.tsx
+    // (the V1/DOM path) uses. This is UX only: repositionFieldWithToken
+    // re-derives and enforces the real eligibility server-side regardless
+    // of what the client believes here.
+    const isFieldEditable = !fieldToRender.inserted && !fieldToRender.fieldMeta?.readOnly;
+
+    /**
+     * Reads the field's current on-screen bounding box and converts it to
+     * percentage-of-page geometry, using the same ratio technique as
+     * EnvelopeEditorFieldsPageRenderer's own handleResizeOrMove:
+     * getClientRect() returns stage-scaled (zoomed) pixels, and dividing by
+     * the equally-scaled viewport cancels the zoom factor out, so the
+     * result is correct at any zoom level.
+     *
+     * Deliberately measures the '.field-rect' CHILD, not fieldGroup itself:
+     * fieldGroup.getClientRect() includes every descendant, and the drag
+     * handle is one -- while it's being actively dragged (potentially far
+     * from the field's own corner), including it would inflate the
+     * measured bounding box into something bigger than the field's actual
+     * visual size. EnvelopeEditorFieldsPageRenderer's own fieldGroup has no
+     * such extra child, so it doesn't need this distinction.
+     */
+    const getFieldPercentageGeometry = () => {
+      const fieldRect = fieldGroup.findOne('.field-rect');
+      const rectClientRect = fieldRect?.getClientRect({ skipStroke: true, skipShadow: true });
+      const { width, height, x, y } =
+        rectClientRect ?? fieldGroup.getClientRect({ skipStroke: true, skipShadow: true });
+
+      const { fieldX, fieldY, fieldWidth, fieldHeight } = convertPixelToPercentage({
+        positionX: x,
+        positionY: y,
+        width,
+        height,
+        pageWidth: scaledViewport.width,
+        pageHeight: scaledViewport.height,
+      });
+
+      return { positionX: fieldX, positionY: fieldY, width: fieldWidth, height: fieldHeight };
+    };
+
+    /**
+     * Persists a drag/resize via the existing, unmodified
+     * repositionFieldWithToken mutation, then repaints the field from that
+     * persisted geometry by re-running this same render function -- reusing
+     * the render pipeline (and every field type's own 'transform' child-
+     * layout handler) to bake the gesture's scale into the field's actual
+     * width/height and reset scale to 1, rather than hand-rolling that
+     * reset here. On rejection, repaints from the field's last known-good
+     * geometry so a rejected change never leaves a mismatched shape on
+     * screen -- the server, not this code, is what decided the rejection.
+     */
+    const persistFieldGeometry = async (geometry: {
+      positionX: number;
+      positionY: number;
+      width: number;
+      height: number;
+    }) => {
+      try {
+        await repositionFieldWithToken({
+          token: recipient.token,
+          fieldId: unparsedField.id,
+          ...geometry,
+        });
+
+        const updatedField: Field & { signature?: Signature | null } = {
+          ...unparsedField,
+          positionX: new Prisma.Decimal(geometry.positionX),
+          positionY: new Prisma.Decimal(geometry.positionY),
+          width: new Prisma.Decimal(geometry.width),
+          height: new Prisma.Decimal(geometry.height),
+        };
+
+        cachedRenderFields.current.set(unparsedField.id, updatedField);
+        renderFieldOnLayer(updatedField, fieldCanvasStyleCache);
+      } catch (err) {
+        console.error(err);
+
+        toast({
+          title: t`Error`,
+          description: t`Could not save this field's position or size. Please try again.`,
+          variant: 'destructive',
+        });
+
+        renderFieldOnLayer(unparsedField, fieldCanvasStyleCache);
+      } finally {
+        pageLayer.current?.batchDraw();
+      }
+    };
+
+    // Tear down any transformer/handle left over from a previous render of
+    // this same field before deciding whether to reattach -- see the
+    // fieldTransformers doc comment above for why this can't be skipped.
+    fieldTransformers.current.get(fieldToRender.id)?.destroy();
+    fieldTransformers.current.delete(fieldToRender.id);
+    fieldGroup.findOne('.field-drag-handle')?.destroy();
+
+    if (isFieldEditable) {
+      // Resize handles, reusing EnvelopeEditorFieldsPageRenderer's own
+      // Konva.Transformer configuration (the sender's placement editor) --
+      // every field type's render-*-field.ts already has its own
+      // 'transform' handler keeping child content (checkbox squares, text,
+      // signature preview) correctly laid out live during this gesture, so
+      // nothing extra is needed here for that.
+      const transformer = new Konva.Transformer({
+        nodes: [fieldGroup],
+        rotateEnabled: false,
+        keepRatio: false,
+        // Deliberately NOT shouldOverdrawWholeArea (EnvelopeEditorFieldsPageRenderer's
+        // sender-side transformer sets this true, but that's because its
+        // fieldGroup itself is fully draggable and relies on this to catch
+        // click/drag anywhere on the field's body). Here fieldGroup stays
+        // non-draggable and the field's own pointerdown-bound click-to-
+        // insert handler must keep working normally -- shouldOverdrawWholeArea
+        // creates an interactive 'back' rect spanning the whole node that
+        // would otherwise sit on top of the field and swallow that click
+        // before it ever reaches the field-rect underneath.
+        ignoreStroke: true,
+        flipEnabled: false,
+        anchorStyleFunc: (anchor) => {
+          anchor.hitStrokeWidth(TRANSFORMER_ANCHOR_HIT_STROKE_PX / scale);
+        },
+        boundBoxFunc: (oldBox, newBox) => {
+          if (newBox.width < MIN_FIELD_WIDTH_PX || newBox.height < MIN_FIELD_HEIGHT_PX) {
+            return oldBox;
+          }
+
+          return newBox;
+        },
+      });
+
+      pageLayer.current.add(transformer);
+      fieldTransformers.current.set(fieldToRender.id, transformer);
+
+      fieldGroup.off('transformend');
+      fieldGroup.on('transformend', () => {
+        void persistFieldGeometry(getFieldPercentageGeometry());
+      });
+
+      // A small, dedicated drag affordance -- a CHILD of fieldGroup, not
+      // fieldGroup itself made draggable. fieldGroup's own pointerdown
+      // handler (handleFieldGroupClick, bound below, unchanged) is what
+      // triggers click-to-insert/sign; keeping fieldGroup itself
+      // non-draggable means that binding never has to distinguish a drag
+      // from a click at all. Konva bubbles events up to ancestors, so the
+      // handle stops its own pointerdown from reaching that listener.
+      const dragHandle = new Konva.Group({
+        name: 'field-drag-handle',
+        x: -DRAG_HANDLE_SIZE_PX / 2,
+        y: -DRAG_HANDLE_SIZE_PX / 2,
+        draggable: true,
+      });
+
+      dragHandle.add(
+        new Konva.Circle({
+          radius: DRAG_HANDLE_SIZE_PX / 2,
+          fill: 'white',
+          stroke: '#9ca3af',
+          strokeWidth: 1,
+        }),
+      );
+
+      for (const dy of [-4, 0, 4]) {
+        dragHandle.add(
+          new Konva.Line({
+            points: [-4, dy, 4, dy],
+            stroke: '#6b7280',
+            strokeWidth: 1.5,
+            lineCap: 'round',
+            listening: false,
+          }),
+        );
+      }
+
+      dragHandle.on('pointerdown', (e) => {
+        e.cancelBubble = true;
+      });
+
+      let dragOrigin = { groupX: 0, groupY: 0, handleX: 0, handleY: 0 };
+
+      dragHandle.on('dragstart', () => {
+        dragOrigin = {
+          groupX: fieldGroup.x(),
+          groupY: fieldGroup.y(),
+          handleX: dragHandle.x(),
+          handleY: dragHandle.y(),
+        };
+      });
+
+      dragHandle.on('dragmove', () => {
+        const deltaX = dragHandle.x() - dragOrigin.handleX;
+        const deltaY = dragHandle.y() - dragOrigin.handleY;
+
+        // Measure '.field-rect', not fieldGroup -- see getFieldPercentageGeometry's
+        // doc comment above for why (the drag handle, a fieldGroup child,
+        // is being actively repositioned right now and would otherwise
+        // inflate fieldGroup's own bounding box).
+        const fieldRectForClamp = fieldGroup.findOne('.field-rect');
+        const { width: fieldWidthPx, height: fieldHeightPx } = (fieldRectForClamp ?? fieldGroup).getClientRect({
+          skipStroke: true,
+          skipShadow: true,
+        });
+
+        // Bound the FIELD to the page (matching upsertFieldGroup's own
+        // dragBoundFunc) -- the handle itself is intentionally left to
+        // follow the raw pointer, so it can briefly separate from the
+        // field near a page edge rather than fighting Konva's own drag
+        // tracking by also rewriting the dragged node's position here.
+        const maxX = scaledViewport.width - fieldWidthPx;
+        const maxY = scaledViewport.height - fieldHeightPx;
+
+        fieldGroup.position({
+          x: Math.max(0, Math.min(maxX, dragOrigin.groupX + deltaX)),
+          y: Math.max(0, Math.min(maxY, dragOrigin.groupY + deltaY)),
+        });
+
+        pageLayer.current?.batchDraw();
+      });
+
+      dragHandle.on('dragend', () => {
+        void persistFieldGeometry(getFieldPercentageGeometry());
+      });
+
+      fieldGroup.add(dragHandle);
+      dragHandle.moveToTop();
+    }
 
     const handleFieldGroupClick = (e: KonvaEventObject<Event>) => {
       const currentTarget = e.currentTarget as Konva.Group;
@@ -576,6 +837,10 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
     // Rerender the whole page.
     pageLayer.current.destroyChildren();
     cachedRenderFields.current.clear();
+    // The transformers destroyChildren() just destroyed are still
+    // referenced here -- drop them too, or a later teardown attempt would
+    // call .destroy() on an already-destroyed Konva node.
+    fieldTransformers.current.clear();
 
     renderFields();
 
