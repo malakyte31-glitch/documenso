@@ -317,3 +317,109 @@ test.describe('field.repositionFieldWithToken -- insert/reposition race', () => 
     );
   });
 });
+
+/**
+ * Permanent regression coverage for a SEPARATE race found while verifying
+ * the fix above: two concurrent repositions of the SAME field (not
+ * insert-vs-reposition) both legitimately match the `inserted: false` guard,
+ * so that conditional `updateMany` alone does not protect the audit log's
+ * "before" snapshot. Without a row lock, request A could read the field's
+ * geometry, request B could then write and commit its own geometry, and
+ * A's own write would still land afterwards -- producing a FIELD_UPDATED
+ * audit entry whose recorded "from" value is stale (it names the geometry
+ * from before EITHER request ran, not the geometry B actually overwrote).
+ * Reproduced locally 8/8 iterations prior to the fix (a `SELECT ... FOR
+ * UPDATE` row lock taken before the "before" read, inside the same
+ * transaction as the write) in reposition-field-with-token.ts. This test
+ * proves the two audit entries' from/to values now chain correctly:
+ * whichever request committed second must record the FIRST request's
+ * already-committed geometry as its "from", never the original seed value.
+ */
+test.describe('field.repositionFieldWithToken -- reposition/reposition audit accuracy', () => {
+  const seedDoubleRepositionField = async (emailPrefix: string) => {
+    const { user, team } = await seedUser();
+    const { recipients, document } = await seedPendingDocumentWithFullFields({
+      owner: user,
+      teamId: team.id,
+      recipients: [`${emailPrefix}@test.documenso.com`],
+      fields: [FieldType.NAME],
+    });
+
+    await prisma.envelope.update({ where: { id: document.id }, data: { internalVersion: 2 } });
+
+    const [recipient] = recipients;
+    const field = recipient.fields[0];
+
+    return { recipient, field, envelopeId: document.id };
+  };
+
+  test('two concurrent repositions of the same field never produce a stale audit before-state', async ({ request }) => {
+    const ITERATIONS = 8;
+
+    for (let i = 0; i < ITERATIONS; i++) {
+      const { recipient, field, envelopeId } = await seedDoubleRepositionField(`v2-audit-race-${i}`);
+      const seededPositionX = field.positionX.toNumber();
+
+      const [resA, resB] = await Promise.all([
+        trpcMutation(request, 'field.repositionFieldWithToken', {
+          token: recipient.token,
+          fieldId: field.id,
+          positionX: 40,
+          positionY: 40,
+          width: 20,
+          height: 5,
+        }),
+        trpcMutation(request, 'field.repositionFieldWithToken', {
+          token: recipient.token,
+          fieldId: field.id,
+          positionX: 60,
+          positionY: 60,
+          width: 20,
+          height: 5,
+        }),
+      ]);
+
+      expect(resA.ok(), `request A failed on iteration ${i}: ${await resA.text()}`).toBeTruthy();
+      expect(resB.ok(), `request B failed on iteration ${i}: ${await resB.text()}`).toBeTruthy();
+
+      const auditLogs = await prisma.documentAuditLog.findMany({
+        where: { envelopeId, type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_UPDATED },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      expect(auditLogs.length, `iteration ${i}: expected exactly 2 FIELD_UPDATED events`).toBe(2);
+
+      const getPositionXChange = (log: (typeof auditLogs)[number]) => {
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+        const logData = log.data as {
+          changes?: Array<{ type: string; from?: { positionX?: number }; to?: { positionX?: number } }>;
+        };
+        const positionChange = logData.changes?.find((c) => c.type === 'POSITION');
+        if (!positionChange?.from || !positionChange?.to) {
+          throw new Error(`iteration ${i}: expected a POSITION change with from/to on log ${log.id}`);
+        }
+        return positionChange;
+      };
+
+      const firstChange = getPositionXChange(auditLogs[0]);
+      const secondChange = getPositionXChange(auditLogs[1]);
+
+      // The first-committed write's "before" is the field's original seed --
+      // nothing else could have touched it yet.
+      expect(firstChange.from?.positionX).toBeCloseTo(seededPositionX);
+
+      // The core invariant this test exists to prove: the second-committed
+      // write's "before" must be exactly what the FIRST write's "after" was
+      // -- never the original seed value (the stale-read bug) and never
+      // anything else.
+      const firstChangeToPositionX = firstChange.to?.positionX;
+      if (firstChangeToPositionX === undefined) {
+        throw new Error(`iteration ${i}: expected first audit entry's "to" to include positionX`);
+      }
+
+      expect(secondChange.from?.positionX, `iteration ${i}: second audit entry has a stale "from"`).toBeCloseTo(
+        firstChangeToPositionX,
+      );
+    }
+  });
+});

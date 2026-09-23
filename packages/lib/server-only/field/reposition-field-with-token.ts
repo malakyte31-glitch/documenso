@@ -105,35 +105,49 @@ export const repositionFieldWithToken = async ({
   }
 
   return await prisma.$transaction(async (tx) => {
-    // The `field.inserted` check above is a fast-fail for the common
-    // case, but it runs on a read taken BEFORE this transaction even
-    // starts -- a concurrent sign-field-with-token (or the V2 equivalent,
-    // envelope.field.sign) call can commit `inserted: true` in the gap
-    // between that read and this write, and this mutation would never
-    // know. This is exactly what let a real drag/resize race a real
-    // insertion on the live P3-C envelope: the reposition's own
-    // unconditional `WHERE id = ...` update happily overwrote geometry on
-    // a field that had, by then, already been inserted.
+    // Row-level lock: no other transaction can read-and-modify this
+    // exact row until this one commits or rolls back (Postgres's
+    // standard SELECT ... FOR UPDATE). Two guarantees depend on this,
+    // not just the `inserted` one below:
     //
-    // Re-reading here, inside the transaction, immediately before the
-    // write, both closes that gap and gives diffFieldChanges an accurate
-    // "before" snapshot for the audit log -- accurate specifically
-    // because the conditional update below only succeeds if `inserted`
-    // still matches what this read just saw.
+    // 1. Insert-vs-reposition (the original P3-C incident): a concurrent
+    //    sign-field-with-token / envelope.field.sign call committing
+    //    `inserted: true` in the gap between a read and this write let a
+    //    real drag/resize race a real insertion -- the reposition's own
+    //    unconditional `WHERE id = ...` update happily overwrote geometry
+    //    on a field that had, by then, already been inserted. The
+    //    conditional `updateMany` below (`WHERE ... AND inserted =
+    //    false`) closes this on its own, lock or not, because Postgres
+    //    evaluates that WHERE clause against whatever is truly the
+    //    current row when the statement runs.
+    //
+    // 2. Reposition-vs-reposition (found separately, while verifying the
+    //    fix for #1): the conditional `updateMany` only guards
+    //    `inserted`, not geometry -- two concurrent repositions of the
+    //    SAME field both match `inserted: false` and both succeed, so
+    //    without a lock, a read taken here to seed the audit log's
+    //    "before" value could still be stale by the time this
+    //    transaction's own write commits, if the OTHER reposition's
+    //    write landed in between. Reproduced locally, 8/8 iterations:
+    //    both resulting audit entries showed the field's ORIGINAL seeded
+    //    geometry as "before", even for the write that actually
+    //    overwrote the OTHER request's just-committed geometry. The lock
+    //    closes this too, by making sure nothing can change the row
+    //    between this read and this transaction's own write.
+    await tx.$executeRaw`SELECT id FROM "Field" WHERE id = ${field.id} FOR UPDATE`;
+
     const freshField = await tx.field.findUniqueOrThrow({
       where: {
         id: field.id,
       },
     });
 
-    // The actual guard: a single atomic UPDATE ... WHERE id = ? AND
-    // inserted = false. Postgres evaluates this WHERE clause against
-    // whatever is truly the current row at the moment this statement
-    // executes, not the stale `field`/`freshField` reads -- if some other
-    // request's insert has already committed `inserted: true` by then,
-    // this matches zero rows and writes nothing, however narrow the
-    // window. `tx.field.update` (singular) has no such condition and
-    // would blindly overwrite the row regardless.
+    // The redundant-looking `inserted: false` guard stays even with the
+    // lock above: it's what actually rejects an already-inserted field
+    // (the lock only guarantees THIS read is accurate, it doesn't decide
+    // whether to proceed), and keeping it here means this statement
+    // remains correct on its own even if some future change ever calls
+    // it without holding the lock first.
     const updateResult = await tx.field.updateMany({
       where: {
         id: field.id,
