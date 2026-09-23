@@ -105,9 +105,39 @@ export const repositionFieldWithToken = async ({
   }
 
   return await prisma.$transaction(async (tx) => {
-    const updatedField = await tx.field.update({
+    // The `field.inserted` check above is a fast-fail for the common
+    // case, but it runs on a read taken BEFORE this transaction even
+    // starts -- a concurrent sign-field-with-token (or the V2 equivalent,
+    // envelope.field.sign) call can commit `inserted: true` in the gap
+    // between that read and this write, and this mutation would never
+    // know. This is exactly what let a real drag/resize race a real
+    // insertion on the live P3-C envelope: the reposition's own
+    // unconditional `WHERE id = ...` update happily overwrote geometry on
+    // a field that had, by then, already been inserted.
+    //
+    // Re-reading here, inside the transaction, immediately before the
+    // write, both closes that gap and gives diffFieldChanges an accurate
+    // "before" snapshot for the audit log -- accurate specifically
+    // because the conditional update below only succeeds if `inserted`
+    // still matches what this read just saw.
+    const freshField = await tx.field.findUniqueOrThrow({
       where: {
         id: field.id,
+      },
+    });
+
+    // The actual guard: a single atomic UPDATE ... WHERE id = ? AND
+    // inserted = false. Postgres evaluates this WHERE clause against
+    // whatever is truly the current row at the moment this statement
+    // executes, not the stale `field`/`freshField` reads -- if some other
+    // request's insert has already committed `inserted: true` by then,
+    // this matches zero rows and writes nothing, however narrow the
+    // window. `tx.field.update` (singular) has no such condition and
+    // would blindly overwrite the row regardless.
+    const updateResult = await tx.field.updateMany({
+      where: {
+        id: field.id,
+        inserted: false,
       },
       data: {
         positionX,
@@ -117,7 +147,17 @@ export const repositionFieldWithToken = async ({
       },
     });
 
-    const changes = diffFieldChanges(field, updatedField);
+    if (updateResult.count === 0) {
+      throw new Error(`Field ${fieldId} has already been inserted -- its geometry is locked`);
+    }
+
+    const updatedField = await tx.field.findUniqueOrThrow({
+      where: {
+        id: field.id,
+      },
+    });
+
+    const changes = diffFieldChanges(freshField, updatedField);
 
     // No-op moves (e.g. a drag that ends where it started) produce no
     // diff -- nothing worth auditing.

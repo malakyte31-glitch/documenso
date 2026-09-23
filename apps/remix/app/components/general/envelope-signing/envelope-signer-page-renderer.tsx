@@ -760,7 +760,53 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
     }
   };
 
+  /**
+   * Immediately (synchronously, before any network round-trip) tears down
+   * a field's Transformer/drag handle so a drag or resize can never be
+   * initiated -- or land -- while an insertion request for that same
+   * field is in flight. This is the actual defect from the live P3-C
+   * incident: geometry controls stayed interactive for the round-trip
+   * duration of an insert, long enough for a real drag/resize gesture to
+   * race it. Waiting for the broader recipientFields refresh (which is
+   * how re-renders normally happen) was too slow -- this acts on the
+   * exact Konva nodes directly, at the one place (signField) every
+   * insertion attempt already funnels through, rather than duplicating
+   * this in each of handleFieldGroupClick's per-type branches.
+   */
+  const lockFieldGeometryEditing = (fieldId: number) => {
+    fieldTransformers.current.get(fieldId)?.destroy();
+    fieldTransformers.current.delete(fieldId);
+
+    const targetGroup = pageLayer.current?.findOne<Konva.Group>(`#${fieldId}`);
+    targetGroup?.findOne('.field-drag-handle')?.destroy();
+
+    pageLayer.current?.batchDraw();
+  };
+
+  /**
+   * Re-runs this field's own render from data this component already
+   * has. Only called when the insertion attempt did NOT result in
+   * field.inserted becoming true (a failure, or a legitimate non-
+   * inserting outcome like a checkbox being unchecked) -- eligibility
+   * (!inserted && !readOnly) is recomputed fresh, so this naturally
+   * restores the Transformer/drag handle when (and only when) the field
+   * is actually still eligible, without needing a parallel "was this
+   * locked by me" flag.
+   */
+  const restoreFieldGeometryEditingIfEligible = (fieldId: number) => {
+    const currentField = localPageFields.find((f) => f.id === fieldId);
+
+    if (!currentField) {
+      return;
+    }
+
+    renderFieldOnLayer(currentField, createFieldCanvasStyleCache());
+    pageLayer.current?.batchDraw();
+  };
+
   const signField = async (fieldId: number, payload: TSignEnvelopeFieldValue, authOptions?: TRecipientActionAuth) => {
+    lockFieldGeometryEditing(fieldId);
+
     try {
       const { inserted } = await signFieldInternal(fieldId, payload, authOptions);
 
@@ -775,7 +821,13 @@ export const EnvelopeSignerPageRenderer = ({ pageData }: { pageData: PageRenderD
       if (!inserted && onFieldUnsigned) {
         onFieldUnsigned({ fieldId });
       }
+
+      if (!inserted) {
+        restoreFieldGeometryEditingIfEligible(fieldId);
+      }
     } catch (err) {
+      restoreFieldGeometryEditingIfEligible(fieldId);
+
       console.error(err);
 
       analytics.captureException(err, {

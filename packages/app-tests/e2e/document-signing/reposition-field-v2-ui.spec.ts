@@ -646,3 +646,163 @@ test.describe('recipient-side field reposition/resize UI (V2 / Konva canvas)', (
     expect(untouched.inserted).toBe(false);
   });
 });
+
+/**
+ * Permanent regression coverage for the mounted-page state transition
+ * (inserted:false -> insertion in flight -> inserted:true) implicated in
+ * the live P3-C incident: the field's Transformer/drag handle used to
+ * stay interactive for the full round-trip of an insertion request,
+ * leaving a real window where a drag/resize could be initiated (and,
+ * without the server-side fix, land) on a field that was, by then,
+ * already inserted. envelope-signer-page-renderer.tsx's signField now
+ * tears down geometry controls immediately (before the network request),
+ * and restores them only if the attempt does not result in
+ * field.inserted becoming true.
+ *
+ * The network response is held via page.route() so the "in flight" state
+ * can be observed deterministically rather than hoping to catch a
+ * normally-fast round-trip mid-flight.
+ */
+test.describe('V2 mounted-page transition: inserted:false -> insertion in flight -> inserted:true', () => {
+  test('geometry controls disappear the instant insertion begins, stay gone after it succeeds, and agree with a refresh', async ({
+    page,
+  }) => {
+    const { user, team } = await seedUser();
+    const { recipients, document } = await seedPendingDocumentWithFullFields({
+      owner: user,
+      teamId: team.id,
+      recipients: ['v2-transition-success-signer@test.documenso.com'],
+      fields: [FieldType.NAME],
+    });
+
+    await prisma.envelope.update({ where: { id: document.id }, data: { internalVersion: 2 } });
+
+    const [recipient] = recipients;
+    const field = recipient.fields[0];
+
+    let releaseSignResponse: (() => void) | undefined;
+    let signRequestSeen = false;
+
+    await page.route('**/api/trpc/envelope.field.sign*', async (route) => {
+      signRequestSeen = true;
+      await new Promise<void>((resolve) => {
+        releaseSignResponse = resolve;
+      });
+      await route.continue();
+    });
+
+    await page.goto(`/sign/${recipient.token}`);
+    await page.waitForTimeout(1500);
+
+    const before = await getKonvaFieldInfo(page, field.id);
+    expect(before.hasDragHandle).toBe(true);
+    expect(before.hasTransformer).toBe(true);
+
+    await page.mouse.click(
+      before.fieldScreenX + before.fieldScreenWidth / 2,
+      before.fieldScreenY + before.fieldScreenHeight / 2,
+    );
+
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
+
+    if (await dialog.isVisible()) {
+      await dialog.locator('input').first().fill('Transition Test Signer');
+      await dialog.getByRole('button', { name: /sign|confirm|next|continue/i }).click();
+    }
+
+    // The request is now held by the route handler -- wait for it to
+    // actually have been issued before checking the "in flight" state.
+    await expect(() => {
+      expect(signRequestSeen).toBe(true);
+    }).toPass({ timeout: 5000 });
+
+    const duringInsert = await getKonvaFieldInfo(page, field.id);
+    expect(duringInsert.hasDragHandle).toBe(false);
+    expect(duringInsert.hasTransformer).toBe(false);
+
+    // Confirm the field genuinely has not been persisted as inserted yet
+    // -- this is checking the state DURING the held request, not after.
+    const midFlight = await prisma.field.findUniqueOrThrow({ where: { id: field.id } });
+    expect(midFlight.inserted).toBe(false);
+
+    releaseSignResponse?.();
+
+    await expect(async () => {
+      const updated = await prisma.field.findUniqueOrThrow({ where: { id: field.id } });
+      expect(updated.inserted).toBe(true);
+    }).toPass();
+
+    const afterInsert = await getKonvaFieldInfo(page, field.id);
+    expect(afterInsert.hasDragHandle).toBe(false);
+    expect(afterInsert.hasTransformer).toBe(false);
+
+    await page.unroute('**/api/trpc/envelope.field.sign*');
+    await page.reload();
+    await page.waitForTimeout(1500);
+
+    const afterReload = await getKonvaFieldInfo(page, field.id);
+    expect(afterReload.hasDragHandle).toBe(false);
+    expect(afterReload.hasTransformer).toBe(false);
+  });
+
+  test('a failed insertion restores geometry editing', async ({ page }) => {
+    const { user, team } = await seedUser();
+    const { recipients, document } = await seedPendingDocumentWithFullFields({
+      owner: user,
+      teamId: team.id,
+      recipients: ['v2-transition-failure-signer@test.documenso.com'],
+      fields: [FieldType.NAME],
+    });
+
+    await prisma.envelope.update({ where: { id: document.id }, data: { internalVersion: 2 } });
+
+    const [recipient] = recipients;
+    const field = recipient.fields[0];
+
+    await page.route('**/api/trpc/envelope.field.sign*', async (route) => {
+      // Simulate a failed insertion attempt (network/server error) rather
+      // than letting the real mutation run.
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify([{ error: { json: { message: 'Simulated failure', code: -32603 } } }]),
+      });
+    });
+
+    await page.goto(`/sign/${recipient.token}`);
+    await page.waitForTimeout(1500);
+
+    const before = await getKonvaFieldInfo(page, field.id);
+    expect(before.hasDragHandle).toBe(true);
+
+    await page.mouse.click(
+      before.fieldScreenX + before.fieldScreenWidth / 2,
+      before.fieldScreenY + before.fieldScreenHeight / 2,
+    );
+
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
+
+    if (await dialog.isVisible()) {
+      await dialog.locator('input').first().fill('Transition Failure Signer');
+      await dialog.getByRole('button', { name: /sign|confirm|next|continue/i }).click();
+    }
+
+    // The simulated failure must not have persisted anything.
+    await expect(async () => {
+      const stillUninserted = await prisma.field.findUniqueOrThrow({ where: { id: field.id } });
+      expect(stillUninserted.inserted).toBe(false);
+    }).toPass();
+
+    // And geometry editing must have come back, not stayed locked from
+    // the failed attempt.
+    await expect(async () => {
+      const restored = await getKonvaFieldInfo(page, field.id);
+      expect(restored.hasDragHandle).toBe(true);
+      expect(restored.hasTransformer).toBe(true);
+    }).toPass();
+
+    await page.unroute('**/api/trpc/envelope.field.sign*');
+  });
+});
